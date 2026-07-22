@@ -1,3 +1,5 @@
+import logging
+
 import pandas as pd
 import pytest
 
@@ -56,6 +58,17 @@ def test_hfwi_calculates_characterized_values_for_one_location(one_hour_weather)
     assert result.loc[0, list(expected)].to_dict() == pytest.approx(
         expected, rel=1e-12, abs=1e-12
     )
+
+
+def test_hfwi_logs_progress_instead_of_printing(one_hour_weather, caplog, capsys):
+    caplog.set_level(logging.INFO, logger=NG_FWI.__name__)
+
+    NG_FWI.hFWI(one_hour_weather, silent=False)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("FWI2025") for message in messages)
+    assert any(message.startswith("Running station group") for message in messages)
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.xfail(
