@@ -5,7 +5,9 @@ import datetime
 import logging
 import argparse
 from math import exp, log, pow, sqrt
+import numpy as np
 import pandas as pd
+from numba import njit, prange
 
 # Import from other CFFDRS code files
 import util
@@ -47,6 +49,17 @@ CONTINUOUS_MULTIYEAR = False  # default False, True to not split by year
 
 ### Functions ###
 
+@njit(cache = True)
+def numpy_round(value, ndigits):
+    """Round weather values with NumPy's Numba-compatible implementation.
+
+    NumPy's fast algorithm can differ slightly from Python's built-in round:
+    np.round(2.85, 1) is 2.8, whereas round(2.85, 1) is 2.9. This can change
+    threshold decisions at boundary inputs. See NumPy's rounding notes:
+    https://numpy.org/devdocs/reference/generated/numpy.round.html#notes
+    """
+    return np.round(value, ndigits)
+
 ##
 # Calculate effective precipitation after applying any canopy intercept
 #
@@ -56,11 +69,12 @@ CONTINUOUS_MULTIYEAR = False  # default False, True to not split by year
 # @param subtract   Canopy intercept reduction (mm)
 # @param rate       Canopy intercept precipitation scaling
 # @return           Moisture code specific effective precipitation (mm)
+@njit(cache = True)
 def prec_effective(prec, prec_sum, threshold, subtract, rate):
-    if round(prec + prec_sum, 1) <= threshold:
+    if numpy_round(prec + prec_sum, 1) <= threshold:
         # Not enough rain to saturate canopy.
         return 0
-    elif round(prec_sum, 1) > threshold:
+    elif numpy_round(prec_sum, 1) > threshold:
         # Already saturated canopy previously.
         return prec * rate
     else:
@@ -68,28 +82,37 @@ def prec_effective(prec, prec_sum, threshold, subtract, rate):
         return (prec_sum+prec)*rate - subtract
 
 # Calculate number of drying "units" this hour contributes
+@njit(cache = True)
 def drying_units():  # temp, rh, ws, rain, solrad
     # for now, just add 1 drying "unit" per hour
     return 1.0
 
-def rain_since_intercept_reset(rain, canopy):
+@njit(cache = True)
+def _rain_since_intercept_reset(rain, rain_total_prev, drying_since_intercept):
     # for now, want 5 "units" of drying (which is 1 per hour to start)
     TARGET_DRYING_SINCE_INTERCEPT = 5.0
     # if raining, reset drying
-    if round(rain, 1) > 0 or canopy["rain_total_prev"] == 0:
-        canopy["drying_since_intercept"] = 0.0
+    if numpy_round(rain, 1) > 0 or rain_total_prev == 0:
+        drying_since_intercept = 0.0
     else:
-        canopy["drying_since_intercept"] += drying_units()
-        if canopy["drying_since_intercept"] >= TARGET_DRYING_SINCE_INTERCEPT:
+        drying_since_intercept += drying_units()
+        if drying_since_intercept >= TARGET_DRYING_SINCE_INTERCEPT:
             # reset rain if intercept reset criteria met
-            canopy["rain_total_prev"] = 0.0
-            canopy["drying_since_intercept"] = 0.0
+            rain_total_prev = 0.0
+            drying_since_intercept = 0.0
+    return rain_total_prev, drying_since_intercept
+
+def rain_since_intercept_reset(rain, canopy):
+    canopy["rain_total_prev"], canopy["drying_since_intercept"] = _rain_since_intercept_reset(
+        rain, canopy["rain_total_prev"], canopy["drying_since_intercept"]
+    )
     return canopy
 
 ##
 # Convert to fine fuel moisture content (%)
 # @param ffmc       Fine Fuel Moisture Code (FFMC)
 # @return           fine fuel moisture content (%)
+@njit(cache = True)
 def ffmc_to_mcffmc(ffmc):
     C_FFMC = 14875 / 101
     return C_FFMC * (101 - ffmc) / (59.5 + ffmc)
@@ -98,6 +121,7 @@ def ffmc_to_mcffmc(ffmc):
 # Convert to FFMC
 # @param mcffmc     fine fuel moisture content (%)
 # @return           FFMC
+@njit(cache = True)
 def mcffmc_to_ffmc(mcffmc):
     C_FFMC = 14875 / 101
     return 59.5 * (250 - mcffmc) / (C_FFMC + mcffmc)
@@ -106,6 +130,7 @@ def mcffmc_to_ffmc(mcffmc):
 # Convert to duff moisture content (%)
 # @param dmc        Duff Moisture Code (DMC)
 # @return           duff moisture content (%)
+@njit(cache = True)
 def dmc_to_mcdmc(dmc):
    return (280 / exp(dmc / 43.43)) + 20
 
@@ -113,6 +138,7 @@ def dmc_to_mcdmc(dmc):
 # Convert to DMC
 # @param mcdmc      duff moisture content (%)
 # @return           DMC
+@njit(cache = True)
 def mcdmc_to_dmc(mcdmc):
    return 43.43 * log(280 / (mcdmc - 20))
 
@@ -120,6 +146,7 @@ def mcdmc_to_dmc(mcdmc):
 # Convert to DC moisture content (%)
 # @param dc         Drought Code (DC)
 # @return           DC moisture content (%)
+@njit(cache = True)
 def dc_to_mcdc(dc):
    return 400 * exp(-dc / 400)
 
@@ -127,6 +154,7 @@ def dc_to_mcdc(dc):
 # Convert to DC
 # @param mcdc       DC moisture content (%)
 # @return           DC
+@njit(cache = True)
 def mcdc_to_dc(mcdc):
    return 400 * log(400 / mcdc)
 
@@ -141,6 +169,7 @@ def mcdc_to_dc(mcdc):
 # @param prec_sum        Cumulative precipitation since start of rain (mm)
 # @param delta_t         Duration of timestep (hr, default 1.0)
 # @return                Hourly fine fuel moisture content (%)
+@njit(cache = True)
 def fine_fuel_moisture_code(
     mc_0,
     temp,
@@ -194,6 +223,7 @@ def fine_fuel_moisture_code(
 # @param prec_cumulative_prev   Cumulative precipitation since start of rain (mm)
 # @param time_increment         Duration of timestep (hr, default 1.0)
 # @return                       Hourly duff moisture content (%)
+@njit(cache = True)
 def duff_moisture_code(
     last_mcdmc,
     hr,
@@ -225,7 +255,7 @@ def duff_moisture_code(
     # since sunset can be > 24, check hr + 24 (ignoring change between days)
     if (sunrise <= hr <= sunset or
         (hr < 6 and sunrise <= hr + 24 <= sunset)):  # daytime
-        if round(temp, 1) < 0:
+        if numpy_round(temp, 1) < 0:
             temp = 0.0
         rk = DMC_REGRESSION * (temp + DMC_OFFSET_TEMP) * (100.0 - rh)
         invtau = rk / 43.43
@@ -250,6 +280,7 @@ def duff_moisture_code(
 # @param prec_cumulative_prev   Cumulative precipitation since start of rain (mm)
 # @param time_increment         Duration of timestep (hr, default 1.0)
 # @return                       Hourly drought code moisture content (%)
+@njit(cache = True)
 def drought_code(
     last_mcdc,
     hr,
@@ -272,7 +303,7 @@ def drought_code(
     # since sunset can be > 24, check hr + 24 (ignoring change between days)
     if (sunrise <= hr <= sunset or
         (hr < 6 and sunrise <= hr + 24 <= sunset)):  # daytime
-        if round(temp, 1) > 0:
+        if numpy_round(temp, 1) > 0:
             pe = DC_REGRESSION * (temp + DC_OFFSET_TEMP) + 3.0 / 16.0
         else:
             pe = 0
@@ -292,6 +323,7 @@ def drought_code(
 # @param wind            Wind Speed (km/h)
 # @param ffmc            Fine Fuel Moisure Code
 # @return                Initial Spread Index
+@njit(cache = True)
 def initial_spread_index(ws, ffmc):
     fm = ffmc_to_mcffmc(ffmc)
     fw = (12 * (1 - exp(-0.0818 * (ws - 28)))) if (40 <= round(ws)) else exp(0.05039 * ws)
@@ -305,6 +337,7 @@ def initial_spread_index(ws, ffmc):
 # @param dmc             Duff Moisture Code
 # @param dc              Drought Code
 # @return                Build-up Index
+@njit(cache = True)
 def buildup_index(dmc, dc):
     bui = 0.0 if (0 == dmc and 0 == dc) else (0.8 * dc * dmc / (dmc + 0.4 * dc))
     if bui < dmc:
@@ -321,6 +354,7 @@ def buildup_index(dmc, dc):
 # @param isi             Initial Spread Index
 # @param bui             Build-up Index
 # @return                Fire Weather Index
+@njit(cache = True)
 def fire_weather_index(isi, bui):
     if bui > 80:
         bb = 0.1 * isi * 1000 / (25 + 108.64 / exp(0.023 * bui))
@@ -330,6 +364,7 @@ def fire_weather_index(isi, bui):
     return fwi
 
 
+@njit(cache = True)
 def daily_severity_rating(fwi):
     return 0.0272 * pow(fwi, 1.77)
 
@@ -345,6 +380,7 @@ def daily_severity_rating(fwi):
 # @param load            Grassland Fuel Load (kg/m^2)
 # @param time_increment  Duration of timestep (hr, default 1.0)
 # @return                Grassland fuel moisture content (percent)
+@njit(cache = True)
 def hourly_grass_fuel_moisture(
     lastmc,
     temp,
@@ -411,6 +447,7 @@ def hourly_grass_fuel_moisture(
         m = e + moe * exp(-1.0 * log(10.0) * xkd * time_increment)
     return m
 
+@njit(cache = True)
 def Pign(mc, wind2m, Cint, Cmc, Cws):
     #  Thisd is the general standard form for the probability of sustained flaming models for each FF cover type
     #     here :
@@ -422,6 +459,7 @@ def Pign(mc, wind2m, Cint, Cmc, Cws):
     Prob = 1.0 / (1.0 + exp(-1.0 * (Cint + Cmc * mc + Cws * wind2m)))
     return Prob
 
+@njit(cache = True)
 def curing_factor(cur):
     # cur is the percentage cure of the grass fuel complex.  100= fully cured
     #   ....The OPPOSITE (100-x) of greenness...
@@ -431,6 +469,7 @@ def curing_factor(cur):
     cf = (1.036 / (1 + 103.989 * exp(-0.0996 * (cur - 20)))) if (cur >= 20.0) else 0.0
     return cf
 
+@njit(cache = True)
 def mcgfmc_to_gfmc(mc, cur, wind):
     #   THIS is the way to get the CODE value from cured grassland moisture
     #     IT takes fully cured grass moisture  (from the grass moisture model (100% cured)  (from the FMS...updated version of Wotton 2009)
@@ -479,6 +518,7 @@ def mcgfmc_to_gfmc(mc, cur, wind):
         egmc = 250.0
     return mcffmc_to_ffmc(egmc)
 
+@njit(cache = True)
 def matted_grass_spread_ROS(ws, mc, cur):
     #  /*  CUT grass  Rate  of spread from cheney 1998  (and new CSIRO grassland code
     #   We use this for MATTED grass in our post-winter context
@@ -505,6 +545,7 @@ def matted_grass_spread_ROS(ws, mc, cur):
     cf = curing_factor(cur)
     return fw * fm * cf
 
+@njit(cache = True)
 def standing_grass_spread_ROS(ws, mc, cur):
     #  /*  standing grass  Rate  of spread from cheney 1998  (and new CSIRO grassland code)
     #   We use this for standing grass in our post-winter context
@@ -540,6 +581,7 @@ def standing_grass_spread_ROS(ws, mc, cur):
 # @param cur             Degree of curing (percent, 0-100)
 # @param standing        Grass standing (True/False)
 # @return                Grassland Spread Index
+@njit(cache = True)
 def grass_spread_index(ws, mc, cur, standing):
     #  So we don't have to transition midseason between standing and matted grass spread rate models
     #  We will simply scale   GSI   by the average of the   matted and standing spread rates
@@ -563,6 +605,7 @@ def grass_spread_index(ws, mc, cur, standing):
 # @param gsi               Grassland Spread Index
 # @param load              Grassland Fuel Load (kg/m^2)
 # @return                  Grassland Fire Weather Index
+@njit(cache = True)
 def grass_fire_weather_index(gsi, load):
     # this just converts back to ROS in m/min
     ros = gsi / 1.11
@@ -571,6 +614,282 @@ def grass_fire_weather_index(gsi, load):
         return(log(Fint / 60.0) / 0.14)
     else:
         return(Fint / 25.0)
+
+_GRID_OUTPUT_VARIABLES = (
+    "mcffmc",
+    "ffmc",
+    "dmc",
+    "dc",
+    "isi",
+    "bui",
+    "fwi",
+    "dsr",
+    "mcgfmc_matted",
+    "mcgfmc_standing",
+    "gfmc",
+    "gsi",
+    "gfwi",
+    "prec_cumulative",
+    "canopy_drying",
+)
+
+
+@njit(cache = True, parallel = True)
+def _hFWI_kernel(
+    temp,
+    rh,
+    ws,
+    prec,
+    solrad,
+    sunrise,
+    sunset,
+    percent_cured,
+    grass_fuel_load,
+    hr,
+    standing,
+    mcffmc_old,
+    dmc_old,
+    dc_old,
+    mcgfmc_matted_old,
+    mcgfmc_standing_old,
+    prec_cumulative_old,
+    canopy_drying_old,
+):
+    """Calculate one or more grid cells in parallel, advancing along time."""
+    n_time, n_cell = temp.shape
+    results = np.empty((len(_GRID_OUTPUT_VARIABLES), n_time, n_cell))
+
+    for cell in prange(n_cell):
+        mcffmc = mcffmc_old[cell]
+        mcdmc = dmc_to_mcdmc(dmc_old[cell])
+        mcdc = dc_to_mcdc(dc_old[cell])
+        mcgfmc_matted = mcgfmc_matted_old[cell]
+        mcgfmc_standing = mcgfmc_standing_old[cell]
+        rain_total_prev = prec_cumulative_old[cell]
+        drying_since_intercept = canopy_drying_old[cell]
+
+        for i in range(n_time):
+            rain_total_prev, drying_since_intercept = _rain_since_intercept_reset(
+                prec[i, cell], rain_total_prev, drying_since_intercept
+            )
+
+            mcffmc = fine_fuel_moisture_code(
+                mcffmc,
+                temp[i, cell],
+                rh[i, cell],
+                ws[i, cell],
+                prec[i, cell],
+                rain_total_prev
+            )
+            ffmc = mcffmc_to_ffmc(mcffmc)
+            mcdmc = duff_moisture_code(
+                mcdmc,
+                hr[i],
+                temp[i, cell],
+                rh[i, cell],
+                prec[i, cell],
+                sunrise[i, cell],
+                sunset[i, cell],
+                rain_total_prev
+            )
+            dmc = mcdmc_to_dmc(mcdmc)
+            mcdc = drought_code(
+                mcdc,
+                hr[i],
+                temp[i, cell],
+                prec[i, cell],
+                sunrise[i, cell],
+                sunset[i, cell],
+                rain_total_prev
+            )
+            dc = mcdc_to_dc(mcdc)
+            isi = initial_spread_index(ws[i, cell], ffmc)
+            bui = buildup_index(dmc, dc)
+            fwi = fire_weather_index(isi, bui)
+            dsr = daily_severity_rating(fwi)
+
+            rain_total_prev += prec[i, cell]
+            mcgfmc_matted = hourly_grass_fuel_moisture(
+                mcgfmc_matted,
+                temp[i, cell],
+                rh[i, cell],
+                ws[i, cell],
+                prec[i, cell],
+                solrad[i, cell],
+                grass_fuel_load[i, cell]
+            )
+            mcgfmc_standing = hourly_grass_fuel_moisture(
+                mcgfmc_standing,
+                temp[i, cell],
+                rh[i, cell],
+                ws[i, cell],
+                prec[i, cell] * 0.06,
+                0.0,
+                grass_fuel_load[i, cell]
+            )
+
+            mcgfmc = mcgfmc_standing if standing[i] else mcgfmc_matted
+            gfmc = mcgfmc_to_gfmc(
+                mcgfmc, percent_cured[i, cell], ws[i, cell]
+            )
+            gsi = grass_spread_index(
+                ws[i, cell], mcgfmc, percent_cured[i, cell], standing[i]
+            )
+            gfwi = grass_fire_weather_index(gsi, grass_fuel_load[i, cell])
+
+            results[0, i, cell] = mcffmc
+            results[1, i, cell] = ffmc
+            results[2, i, cell] = dmc
+            results[3, i, cell] = dc
+            results[4, i, cell] = isi
+            results[5, i, cell] = bui
+            results[6, i, cell] = fwi
+            results[7, i, cell] = dsr
+            results[8, i, cell] = mcgfmc_matted
+            results[9, i, cell] = mcgfmc_standing
+            results[10, i, cell] = gfmc
+            results[11, i, cell] = gsi
+            results[12, i, cell] = gfwi
+            results[13, i, cell] = rain_total_prev
+            results[14, i, cell] = drying_since_intercept
+
+    return results
+
+
+def _hFWI(
+    ds_wx,
+    ffmc_old = FFMC_DEFAULT,
+    mcffmc_old = None,
+    dmc_old = DMC_DEFAULT,
+    dc_old = DC_DEFAULT,
+    mcgfmc_matted_old = ffmc_to_mcffmc(FFMC_DEFAULT),
+    mcgfmc_standing_old = ffmc_to_mcffmc(FFMC_DEFAULT),
+    prec_cumulative = 0.0,
+    canopy_drying = 0.0,
+):
+    """Calculate hourly FWI for an xarray grid.
+
+    The calculation is sequential over ``time`` and parallel over all ``lat``
+    and ``lon`` cells. Weather variables may already have all three dimensions
+    or be broadcastable to them. Startup state may be scalar or a spatial
+    DataArray.
+
+    Args:
+        ds_wx: Hourly weather with ``time``, ``lat``, and ``lon`` dimensions.
+            Required variables are ``temp``, ``rh``, ``ws``, ``prec``,
+            ``solrad``, ``sunrise``, ``sunset``, ``percent_cured``, and
+            ``grass_fuel_load``.
+        ffmc_old: Initial FFMC, as a scalar or spatial field.
+        mcffmc_old: Initial fine-fuel moisture content. When provided, this is
+            used instead of ``ffmc_old``.
+        dmc_old: Initial DMC, as a scalar or spatial field.
+        dc_old: Initial DC, as a scalar or spatial field.
+        mcgfmc_matted_old: Initial matted-grass moisture content.
+        mcgfmc_standing_old: Initial standing-grass moisture content.
+        prec_cumulative: Initial cumulative precipitation for the active event.
+        canopy_drying: Initial consecutive canopy-drying hours.
+
+    Returns:
+        A copy of ``ds_wx`` with hourly FWI state and index variables added.
+
+    Raises:
+        ValueError: If dimensions or variables are missing, time is not
+            sequentially hourly, or the input spans multiple calendar years.
+    """
+    import xarray as xr
+
+    required_dims = {"time", "lat", "lon"}
+    required_variables = {
+        "temp", "rh", "ws", "prec", "solrad", "sunrise", "sunset",
+        "percent_cured", "grass_fuel_load"
+    }
+    missing_dims = required_dims.difference(ds_wx.dims)
+    missing_variables = required_variables.difference(ds_wx.data_vars)
+    if missing_dims:
+        raise ValueError("Missing required dimensions: " + ", ".join(sorted(missing_dims)))
+    if missing_variables:
+        raise ValueError(
+            "Missing required variables: " + ", ".join(sorted(missing_variables))
+        )
+
+    time = pd.DatetimeIndex(ds_wx["time"].values)
+    if len(time) == 0:
+        raise ValueError("Expected at least one timestep")
+    if len(time) > 1 and not np.all(np.diff(time.values) == np.timedelta64(1, "h")):
+        raise ValueError("Expected hourly weather input to be sequential")
+    if len(np.unique(time.year)) != 1:
+        raise ValueError("_hFWI currently accepts one calendar year at a time")
+
+    dims = ("time", "lat", "lon")
+    shape = (ds_wx.sizes["time"], ds_wx.sizes["lat"], ds_wx.sizes["lon"])
+    template = xr.DataArray(
+        np.empty(shape),
+        coords={dim: ds_wx.coords[dim] for dim in dims},
+        dims=dims
+    )
+
+    def weather_values(name):
+        values, _ = xr.broadcast(ds_wx[name], template)
+        return np.ascontiguousarray(values.transpose(*dims).values.reshape(shape[0], -1))
+
+    spatial_template = template.isel(time = 0, drop = True)
+
+    def state_values(value):
+        if isinstance(value, xr.DataArray):
+            values, _ = xr.broadcast(value, spatial_template)
+            return np.ascontiguousarray(values.transpose("lat", "lon").values.ravel())
+        return np.full(shape[1] * shape[2], float(value))
+
+    if mcffmc_old is None:
+        ffmc_start = state_values(ffmc_old)
+        C_FFMC = 14875 / 101
+        mcffmc_start = C_FFMC * (101 - ffmc_start) / (59.5 + ffmc_start)
+    else:
+        mcffmc_start = state_values(mcffmc_old)
+
+    DATE_GRASS_STANDING = datetime.date(time[0].year, MON_STANDING, DAY_STANDING)
+    if DATE_GRASS_STANDING < time[0].date():
+        DATE_GRASS_STANDING = datetime.date(
+            time[0].year + 1, MON_STANDING, DAY_STANDING
+        )
+    standing = np.asarray([
+        not GRASS_TRANSITION or timestamp.date() >= DATE_GRASS_STANDING
+        for timestamp in time
+    ])
+
+    logger.debug(
+        "Calculating hourly FWI for %s timesteps and %s grid cells",
+        shape[0], shape[1] * shape[2]
+    )
+    values = _hFWI_kernel(
+        weather_values("temp"),
+        weather_values("rh"),
+        weather_values("ws"),
+        weather_values("prec"),
+        weather_values("solrad"),
+        weather_values("sunrise"),
+        weather_values("sunset"),
+        weather_values("percent_cured"),
+        weather_values("grass_fuel_load"),
+        time.hour.to_numpy(dtype = float),
+        standing,
+        np.ascontiguousarray(mcffmc_start),
+        state_values(dmc_old),
+        state_values(dc_old),
+        state_values(mcgfmc_matted_old),
+        state_values(mcgfmc_standing_old),
+        state_values(prec_cumulative),
+        state_values(canopy_drying),
+    )
+
+    result = ds_wx.copy()
+    for i, name in enumerate(_GRID_OUTPUT_VARIABLES):
+        result[name] = xr.DataArray(
+            values[i].reshape(shape),
+            coords=template.coords,
+            dims=dims
+        )
+    return result
 
 ##
 # Calculate hourly FWI indices from hourly weather stream for a single station
